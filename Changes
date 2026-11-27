@@ -1,0 +1,4 @@
+Revision history for Alien-LibTorch
+
+0.001   2026-11-25
+        - Initial cross-platform Alien::Build distribution for LibTorch.

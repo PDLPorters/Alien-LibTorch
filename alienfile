@@ -1,0 +1,110 @@
+use alienfile;
+use File::Spec;
+
+my $TORCH_VER = $ENV{ALIEN_LIBTORCH_VERSION} || '2.15.0';
+
+sub _detect_accel {
+    return $ENV{ALIEN_LIBTORCH_ACCEL} if $ENV{ALIEN_LIBTORCH_ACCEL};
+    return 'cpu' if $^O eq 'darwin'; # macOS arm64 archive includes MPS (Metal)
+    my $smi = `nvidia-smi 2>/dev/null`;
+    if (defined $smi && $smi =~ /CUDA Version:\s*(\d+)\.(\d+)/) {
+        my ($maj, $min) = ($1, $2);
+        return 'cu134' if $maj > 13 || ($maj == 13 && $min >= 4);
+        return 'cu132' if $maj == 13 && $min >= 2;
+    }
+    return 'cpu';
+}
+
+sub _extra_accel_libs {
+    my ($libdir) = @_;
+    my @extra;
+    if (glob(File::Spec->catfile($libdir, '*torch_cuda*'))) {
+        push @extra, '-ltorch_cuda', '-lc10_cuda';
+    }
+    if (glob(File::Spec->catfile($libdir, '*torch_hip*'))) {
+        push @extra, '-ltorch_hip', '-lc10_hip';
+    }
+    return @extra ? ' ' . join(' ', @extra) : '';
+}
+
+probe sub {
+    my ($build) = @_;
+    my @roots;
+    push @roots, $ENV{LIBTORCH_DIR} if $ENV{LIBTORCH_DIR};
+    if ($^O eq 'darwin') {
+        chomp(my $bp = `brew --prefix pytorch 2>/dev/null` || '');
+        push @roots, $bp if $bp;
+    }
+    push @roots, '/usr/local', '/usr';
+
+    for my $r (@roots) {
+        if (-f File::Spec->catfile($r, 'include', 'torch', 'csrc', 'api', 'include', 'torch', 'torch.h')
+         || -f File::Spec->catfile($r, 'include', 'torch', 'torch.h')) {
+            $build->install_prop->{my_system_root} = $r;
+            return 'system';
+        }
+    }
+    return 'share';
+};
+
+sys {
+    gather sub {
+        my ($build) = @_;
+        my $r = $build->install_prop->{my_system_root};
+        my $inc1 = File::Spec->catdir($r, 'include');
+        my $inc2 = File::Spec->catdir($r, 'include', 'torch', 'csrc', 'api', 'include');
+        my $lib  = -d File::Spec->catdir($r, 'lib64') ? File::Spec->catdir($r, 'lib64') : File::Spec->catdir($r, 'lib');
+        my $cflags = -d $inc2 ? "-I$inc1 -I$inc2" : "-I$inc1";
+        my $rpath  = $^O eq 'MSWin32' ? '' : "-Wl,-rpath,$lib ";
+        my $extra  = _extra_accel_libs($lib);
+        $build->runtime_prop->{cflags}  = $cflags;
+        $build->runtime_prop->{libs}    = "-L$lib ${rpath}-ltorch -ltorch_cpu -lc10${extra}";
+        $build->runtime_prop->{version} = 'system';
+    };
+};
+
+share {
+    my $accel = _detect_accel();
+    my $url;
+    if ($^O eq 'darwin') {
+        $url = "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-${TORCH_VER}.zip";
+    } elsif ($^O eq 'MSWin32') {
+        $url = "https://download.pytorch.org/libtorch/${accel}/libtorch-win-shared-with-deps-${TORCH_VER}%2B${accel}.zip";
+    } else {
+        $url = "https://download.pytorch.org/libtorch/${accel}/libtorch-shared-with-deps-${TORCH_VER}%2B${accel}.zip";
+    }
+
+    start_url $url;
+    plugin Download => ();
+    plugin Extract  => 'zip';
+
+    build [
+        sub {
+            my ($build) = @_;
+            require File::Copy::Recursive;
+            my $src   = $build->install_prop->{extract};
+            my $stage = $build->install_prop->{stage};
+            for my $sub (qw(include lib share)) {
+                my $from = File::Spec->catdir($src, $sub);
+                my $to   = File::Spec->catdir($stage, $sub);
+                next unless -d $from;
+                File::Copy::Recursive::dircopy($from, $to)
+                    or die "dircopy($from, $to) failed: $!";
+            }
+        },
+    ];
+
+    gather sub {
+        my ($build) = @_;
+        my $prefix = $build->runtime_prop->{prefix};
+        my $stage  = $build->install_prop->{stage};
+        my $inc1   = "$prefix/include";
+        my $inc2   = "$prefix/include/torch/csrc/api/include";
+        my $lib    = "$prefix/lib";
+        my $rpath  = $^O eq 'MSWin32' ? '' : "-Wl,-rpath,$lib ";
+        my $extra  = _extra_accel_libs(File::Spec->catdir($stage, 'lib'));
+        $build->runtime_prop->{cflags}  = "-I$inc1 -I$inc2";
+        $build->runtime_prop->{libs}    = "-L$lib ${rpath}-ltorch -ltorch_cpu -lc10${extra}";
+        $build->runtime_prop->{version} = $TORCH_VER;
+    };
+};
